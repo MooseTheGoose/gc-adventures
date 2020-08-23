@@ -205,13 +205,21 @@ void sweeper_thread()
     if(local_prev != begin) 
     { 
       local_prev = begin->addme_next;
-      local_meta = local_prev->addme_next;
-      while(local_meta && local_meta->addme)
+      /*
+       * Allocator could change begin->addme_next to null right after its addme 
+       * value gets set to 0 above and before we assign begin->addme_next to 
+       * local_prev.
+       */
+      if(local_prev)
       {
-        local_prev = local_meta;
-        local_meta = local_meta->addme_next;
+        local_meta = local_prev->addme_next;
+        while(local_meta && local_meta->addme)
+        {
+          local_prev = local_meta;
+          local_meta = local_meta->addme_next;
+        }
+        local_prev->addme_next = 0;
       }
-      local_prev->addme_next = 0;
     }    
 
     local_meta = begin->mark_next;
