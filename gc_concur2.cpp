@@ -13,7 +13,8 @@ using std::vector;
 static gcofs_t strong_table[] = {0};
 static const size_t heap_sz = 1 << 30;
 static align_t *test_heap;
-static gc_meta *volatile safe_next;
+
+static volatile int please_collect;
 
 void gc_init()
 {
@@ -29,23 +30,22 @@ void gc_init()
   gc_meta *begin = (gc_meta *)test_heap;
   begin->rrcnt = 1;
   begin->mark = 1;
-  begin->sweep  = 0;
+  begin->sweep = 0;
   begin->refarray = 0;
-  begin->addme = 0;
   begin->srtptr = 0;
   begin->len = sizeof(gc_meta);
   begin->alloc_next = 0;
   begin->mark_next = 0;
-  begin->addme_next = 0;
 
   CreateThread(0, 0, (LPTHREAD_START_ROUTINE)sweeper_thread, 0, 0, 0);
 }
 
 /*
- *  For gc_create_ref and sweeper_thread, note that each have their
- *  own linked lists and that the only list they share is the addme
- *  list. The sweeper will remove from the addme list in a way such
- *  that the allocator never overwrite metadata in the addme list.
+ *  For gc_create_ref and sweeper_thread, note that they share
+ *  the mark list. Writes to this list will be synchronized
+ *  and if the allocator needs to add a node, it will keep
+ *  a private addme list and will add everything in that
+ *  list for the next time it gets permission to write.
  */
 void *gc_create_ref(gclen_t len, gcofs_t srtptr, int flags)
 {
@@ -54,8 +54,32 @@ void *gc_create_ref(gclen_t len, gcofs_t srtptr, int flags)
 
   gc_meta *begin = (gc_meta *)test_heap;
   gc_meta *trail, *prev_trail;
-  gc_meta *check_addme;
+  gc_meta *check_mark;
   char *test = (char *)(begin + 1);
+
+  /*
+   *  Collect when the tracer asks you nicely.
+   */
+  if(please_collect)
+  {
+    begin->mark_next = 0;
+    trail = begin->alloc_next;
+    prev_trail = begin;
+
+    while(trail)
+    {
+      if(!trail->sweep)
+      {
+        trail->mark_next = begin->mark_next;
+        begin->mark_next = trail;
+        prev_trail->alloc_next = trail;
+        prev_trail = trail;
+      }
+      trail = trail->alloc_next;
+    }
+    prev_trail->alloc_next = 0;
+    please_collect = 0;
+  }
 
   /*
    *  Use begin to ensure prev_trail is never null
@@ -63,21 +87,13 @@ void *gc_create_ref(gclen_t len, gcofs_t srtptr, int flags)
   prev_trail = begin;
   trail = prev_trail->alloc_next;
 
-  /*
-   *  Sweeper leaves begin->addme_next unmonitored,
-   *  so if allocator collects prematurely, contents
-   *  of begin->addme_next are undefined.
-   */
-  check_addme = begin->addme_next;
-  if(check_addme && !check_addme->addme)
-  { begin->addme_next = 0; }
 
   /*
    *  If there's space at the beginning of the alloc list,
    *  put it at the beginning and mark it for adding to
    *  the mark list. Note that for all additions, it's very, very
    *  important to complete all initialization before adding it
-   *  to the addme list.
+   *  to the addme or mark lists.
    */
   if(trail != begin + 1 && test + true_len < (char *)trail)
   {
@@ -85,15 +101,13 @@ void *gc_create_ref(gclen_t len, gcofs_t srtptr, int flags)
     retmeta->rrcnt = 1;
     retmeta->mark = 1;
     retmeta->sweep = 0;
-    retmeta->addme = 1;
     retmeta->srtptr = srtptr;
     retmeta->len = true_len;
     retmeta->alloc_next = trail;
-    retmeta->addme_next = begin->addme_next;
     memset(retmeta + 1, 0, len);
-    begin->addme_next = retmeta;
     begin->alloc_next = retmeta;
-    return retmeta + 1;
+
+    return retmeta + 1; 
   }
 
   /*
@@ -105,32 +119,18 @@ void *gc_create_ref(gclen_t len, gcofs_t srtptr, int flags)
     test = (char *)trail + trail->len;
     gc_meta *local_next = trail->alloc_next;
 
-    /*
-     *  If trail is marked for sweeping, delete it,
-     *  pin prev_trail, and adjust trail. Otherwise, 
-     *  if there's space, allocate it and mark the space 
-     *  for adding to mark list. Otherwise, move prev_trail 
-     *  and trail up by one node.
-     */
-    if(trail->sweep)
-    {
-      prev_trail->alloc_next = local_next;
-      trail = local_next;
-    }
-    else if(test + true_len < (char *)local_next)
+    if(test + true_len < (char *)local_next)
     {
       gc_meta *retmeta = (gc_meta *)test;
       retmeta->rrcnt = 1;
       retmeta->mark = 1;
       retmeta->sweep = 0;
-      retmeta->addme = 1;
       retmeta->srtptr = srtptr;
       retmeta->len = true_len;
       retmeta->alloc_next = local_next;
-      retmeta->addme_next = begin->addme_next;
       memset(retmeta + 1, 0, len);
-      begin->addme_next = retmeta;
       trail->alloc_next = retmeta;
+
       return retmeta + 1;
     }
     else
@@ -151,17 +151,14 @@ void *gc_create_ref(gclen_t len, gcofs_t srtptr, int flags)
     retmeta->rrcnt = 1;
     retmeta->mark = 1;
     retmeta->sweep = 0;
-    retmeta->addme = 1;
     retmeta->srtptr = srtptr;
     retmeta->len = true_len;
     retmeta->alloc_next = 0;
-    retmeta->addme_next = begin->addme_next;
     memset(retmeta + 1, 0, len);
-    begin->addme_next = retmeta;
     prev_trail->alloc_next = retmeta;
+
     return retmeta + 1;
   }
-
 
   return 0;
 }
@@ -175,53 +172,9 @@ void sweeper_thread()
   while(1)
   {
 /* ------------------------------------ */
-    /*
-     *  Every node in the addme list should have 
-     *  an addme value of 1 when the sweeper messes
-     *  around with a list and after it's done messing
-     *  around, except for possibly begin->addme_next
-     *  (which the allocator will personally monitor).
-     *
-     *  To do this, get the current head of the addme_list
-     *  and until the nodes are null or the addme value is 0,
-     *  add the node to the mark list and set its addme value to 0.
-     *
-     *  Afterwards, reiterate through the list (because it's volatile)
-     *  and as soon as a node with addme value of 0 or null is encountered,
-     *  remove it. Since allocator itself guarantees that every node it adds
-     *  has an addme value of 1, the model of the list is sound.
-     */
-    local_meta = begin->addme_next;
-    local_prev = begin;
-    while(local_meta && local_meta->addme)
-    {
-      printf("%p\r\n", local_meta);
+    while(please_collect) {}
 
-      local_meta->mark_next = begin->mark_next;
-      begin->mark_next = local_meta;
-      local_meta->addme = 0;
-      local_meta = local_meta->addme_next;
-    }
-    if(local_prev != begin) 
-    { 
-      local_prev = begin->addme_next;
-      /*
-       * Allocator could change begin->addme_next to null right after its addme 
-       * value gets set to 0 above and before we assign begin->addme_next to 
-       * local_prev.
-       */
-      if(local_prev)
-      {
-        local_meta = local_prev->addme_next;
-        while(local_meta && local_meta->addme)
-        {
-          local_prev = local_meta;
-          local_meta = local_meta->addme_next;
-        }
-        local_prev->addme_next = 0;
-      }
-    }    
-
+    /* Clear */
     local_meta = begin->mark_next;
     while(local_meta)
     {
@@ -229,6 +182,7 @@ void sweeper_thread()
       local_meta = local_meta->mark_next;
     }
 
+    /* Mark */
     local_meta = begin->mark_next;
     while(local_meta)
     {
@@ -262,20 +216,17 @@ void sweeper_thread()
       local_meta = local_meta->mark_next;
     }
 
+    /* Sweep */
     local_meta = begin->mark_next;
-    local_prev = begin;
     while(local_meta)
     {
-      if(!local_meta->mark) 
-      { 
-        /* The order of operations is uber-important here. */
-        local_prev->mark_next = local_meta->mark_next;
-        local_meta->sweep = 1; 
+      if(!local_meta->mark)
+      {
+        local_meta->sweep = 1;
       }
-      else { local_prev = local_meta; }
-
       local_meta = local_meta->mark_next;
     }
+    please_collect = 1;
 /* ------------------------------------ */
   }
 }
@@ -296,16 +247,13 @@ int main()
 {
   srand(time(0));
   gc_init();
+  char *tracker = 0;
 
   while(1)
   {
-    int size = rand() & 0xFF;
-    if(size)
-    {
-      void *someref = gc_create_ref(rand() % 0x100 + 1, 0, 0);
-      printf("%p\r\n", someref);
-      gc_dec_rrcnt(someref);
-    }
+    char *someref = (char *)gc_create_ref(0x80, 0, 0);
+    printf("%p\r\n", someref);
+    gc_dec_rrcnt(someref);
   }
   return 0;
 }

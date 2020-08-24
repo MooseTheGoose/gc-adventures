@@ -14,12 +14,10 @@ struct gc_meta
   volatile gcrcnt_t mark         : 1;
   volatile gcrcnt_t sweep        : 1;
   volatile gcrcnt_t refarray     : 1;
-  volatile gcrcnt_t addme        : 1;
   gcofs_t srtptr;
   gclen_t len;
   gc_meta *alloc_next;
-  gc_meta *mark_next;
-  gc_meta *volatile addme_next;
+  gc_meta *volatile mark_next;
 };
 
 #define REFARRAY_FLAG 1
